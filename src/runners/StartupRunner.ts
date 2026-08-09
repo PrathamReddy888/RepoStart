@@ -57,8 +57,10 @@ interface ManagedTerminal {
   name: string;
   /** Whether we've already fired the "stopped" callback. */
   closed: boolean;
-  /** Temp file path — created when the command exits, regardless of shell. */
+  /** Temp file path — created when the command exits. */
   exitFile: string;
+  /** Path to the wrapper JS file. */
+  wrapperFile: string;
 }
 
 const POLLER_INTERVAL_MS = 1000;
@@ -137,6 +139,56 @@ export class StartupRunner {
     this._startExitPolling();
   }
 
+  /**
+   * Create a Node.js wrapper script that:
+   * 1. Spawns the actual command (npm run start, etc.)
+   * 2. Pipes stdin/stdout/stderr to the terminal (user sees all output)
+   * 3. When the command exits, writes the exit code to a temp file
+   *
+   * This is SHELL-AGNOSTIC — works identically on bash, zsh, PowerShell,
+   * cmd.exe, fish, etc. because it's just `node wrapper.js`.
+   */
+  private _createWrapperScript(cmd: string, cwd: string, exitFile: string): string {
+    const wrapperPath = path.join(os.tmpdir(), `repostart-wrapper-${uid()}.js`);
+
+    // The wrapper script spawns the command, inherits stdio (so the user
+    // sees all output in the terminal), and writes the exit code to a
+    // file when the command finishes. The script process then EXITS,
+    // which means terminal.exitStatus will ALSO become defined — giving
+    // us two detection mechanisms.
+    const script = `
+const { spawn } = require('child_process');
+const fs = require('fs');
+const exitFile = ${JSON.stringify(exitFile)};
+const cmd = ${JSON.stringify(cmd)};
+const cwd = ${JSON.stringify(cwd)};
+
+const child = spawn(cmd, {
+  shell: true,
+  stdio: 'inherit',
+  cwd: cwd,
+  env: process.env
+});
+
+child.on('error', (err) => {
+  console.error('Failed to start:', err.message);
+  try { fs.writeFileSync(exitFile, '1'); } catch {}
+  process.exit(1);
+});
+
+child.on('exit', (code, signal) => {
+  const exitCode = code !== null ? code : (signal ? 1 : 0);
+  try { fs.writeFileSync(exitFile, String(exitCode)); } catch {}
+  // Exit the wrapper process too — this makes terminal.exitStatus
+  // fire as a backup detection mechanism.
+  process.exit(exitCode);
+});
+`;
+
+    fs.writeFileSync(wrapperPath, script, 'utf-8');
+    return wrapperPath;
+  }
+
   private _launchInTerminal(
     app: AppFolder,
     parentTerminal?: vscode.Terminal
@@ -155,21 +207,12 @@ export class StartupRunner {
     // Generate a unique temp file for this terminal's exit code.
     const exitFile = path.join(os.tmpdir(), `repostart-exit-${uid()}.txt`);
 
-    // Wrap the command so the exit code is written to a temp file
-    // AFTER the command finishes. This works regardless of whether
-    // the shell (bash/cmd) stays open — the file appears as soon as
-    // the command exits, which is what we need to detect crashes.
-    //
-    // The shell stays open so the user can see the error output.
-    // We just get the exit code via the file.
-    let wrappedCmd: string;
-    if (process.platform === 'win32') {
-      // Windows cmd.exe: & runs the next command regardless of exit code
-      wrappedCmd = `${cmd} & echo %errorlevel% > "${exitFile}"`;
-    } else {
-      // Unix (bash/zsh): ; runs the next command regardless of exit code
-      wrappedCmd = `${cmd}; echo $? > "${exitFile}"`;
-    }
+    // Create the shell-agnostic wrapper script.
+    const wrapperFile = this._createWrapperScript(cmd, app.path, exitFile);
+
+    // The command to run in the terminal is just: node /path/to/wrapper.js
+    // This works on ALL shells — bash, zsh, PowerShell, cmd.exe, fish.
+    const wrappedCmd = `node "${wrapperFile}"`;
 
     const terminalOptions: vscode.TerminalOptions = {
       name,
@@ -191,11 +234,14 @@ export class StartupRunner {
       name,
       closed: false,
       exitFile,
+      wrapperFile,
     };
 
     this.managedTerminals.push(managed);
 
-    this.log(`_launchInTerminal: ${role} [${app.relativePath}] → running (exitFile=${exitFile})`);
+    this.log(`_launchInTerminal: ${role} [${app.relativePath}] → running`);
+    this.log(`  wrapper: ${wrapperFile}`);
+    this.log(`  exitFile: ${exitFile}`);
 
     this.onServiceStatus?.({
       label: role,
@@ -218,54 +264,62 @@ export class StartupRunner {
     return terminal;
   }
 
-  // ── Exit polling via temp file ──────────────────────────────────
+  // ── Exit polling via temp file + terminal.exitStatus ────────────
 
   private _startExitPolling(): void {
     if (this._exitPoller) return;
-    this.log(`Starting exit-file poller (interval: ${POLLER_INTERVAL_MS}ms)`);
+    this.log(`Starting exit poller (interval: ${POLLER_INTERVAL_MS}ms)`);
     this._exitPoller = setInterval(() => {
-      this._checkExitFiles();
+      this._checkTerminalExits();
     }, POLLER_INTERVAL_MS);
   }
 
   private _stopExitPolling(): void {
     if (this._exitPoller) {
-      this.log('Stopping exit-file poller');
+      this.log('Stopping exit poller');
       clearInterval(this._exitPoller);
       this._exitPoller = undefined;
     }
   }
 
   /**
-   * Check each managed terminal's exit file.
-   * When the file exists, the command has exited (crash or normal).
+   * Check each managed terminal for exit.
+   *
+   * DUAL DETECTION:
+   * 1. Exit file exists → command exited (primary, works even if shell
+   *    stays open)
+   * 2. terminal.exitStatus is defined → terminal process exited
+   *    (backup, works when wrapper script exits)
    */
-  private _checkExitFiles(): void {
+  private _checkTerminalExits(): void {
     for (const mt of this.managedTerminals) {
       if (mt.closed) continue;
 
-      let exists = false;
+      // Method 1: Check exit file (command exited)
+      let exitCode: number | null = null;
       try {
-        exists = fs.existsSync(mt.exitFile);
-      } catch {
-        continue;
+        if (fs.existsSync(mt.exitFile)) {
+          const content = fs.readFileSync(mt.exitFile, 'utf-8').trim();
+          exitCode = parseInt(content, 10);
+          if (isNaN(exitCode)) exitCode = 1;
+          this.log(`_checkTerminalExits: "${mt.name}" exit FILE detected (code=${exitCode})`);
+        }
+      } catch { /* ignore */ }
+
+      // Method 2: Check terminal.exitStatus (terminal process exited)
+      if (exitCode === null) {
+        try {
+          const status = mt.terminal.exitStatus;
+          if (status !== undefined) {
+            exitCode = status.code;
+            this.log(`_checkTerminalExits: "${mt.name}" exit STATUS detected (code=${exitCode})`);
+          }
+        } catch { /* ignore */ }
       }
 
-      if (!exists) continue;
-
-      // Read the exit code
-      let exitCode = 1;
-      try {
-        const content = fs.readFileSync(mt.exitFile, 'utf-8').trim();
-        exitCode = parseInt(content, 10);
-        if (isNaN(exitCode)) exitCode = 1;
-      } catch { /* default to 1 */ }
-
-      // Clean up the temp file
-      try { fs.unlinkSync(mt.exitFile); } catch { /* ignore */ }
-
-      this.log(`_checkExitFiles: "${mt.name}" command exited (code=${exitCode})`);
-      this._handleProcessExit(mt, exitCode);
+      if (exitCode !== null) {
+        this._handleProcessExit(mt, exitCode);
+      }
     }
   }
 
@@ -279,6 +333,10 @@ export class StartupRunner {
     if (idx >= 0) {
       this.managedTerminals.splice(idx, 1);
     }
+
+    // Clean up temp files
+    try { fs.unlinkSync(mt.exitFile); } catch { /* ignore */ }
+    try { fs.unlinkSync(mt.wrapperFile); } catch { /* ignore */ }
 
     this.log(`_handleProcessExit: sending ${mt.role} → stopped to dashboard`);
 
@@ -345,6 +403,10 @@ export class StartupRunner {
 
     this.managedTerminals.splice(idx, 1);
 
+    // Clean up temp files
+    try { fs.unlinkSync(managed.exitFile); } catch { /* ignore */ }
+    try { fs.unlinkSync(managed.wrapperFile); } catch { /* ignore */ }
+
     this.log(`handleTerminalClose: processing close for ${managed.role} [${managed.relativePath}]`);
 
     this.onServiceStatus?.({
@@ -396,8 +458,9 @@ export class StartupRunner {
 
     for (const mt of toKill) {
       mt.closed = true;
-      // Clean up temp file if it exists
+      // Clean up temp files
       try { fs.unlinkSync(mt.exitFile); } catch { /* ignore */ }
+      try { fs.unlinkSync(mt.wrapperFile); } catch { /* ignore */ }
       try {
         mt.terminal.dispose();
         this.onServiceStatus?.({
