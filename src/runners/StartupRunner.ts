@@ -1,9 +1,6 @@
 import * as vscode from 'vscode';
-import * as os from 'os';
-import * as path from 'path';
-import * as fs from 'fs';
-import { EventEmitter } from 'events';
-import { AppFolder, LogEntry, LogLevel, PackageManager, ServiceStatus, ServiceState } from '../types';
+import { spawn, ChildProcess } from 'child_process';
+import { AppFolder, LogEntry, PackageManager, ServiceStatus } from '../types';
 import { ActivityTimeline, TimelineStep } from '../services/ActivityTimeline';
 import { LogStreamer } from '../services/LogStreamer';
 import { now, uid } from '../utils/fs';
@@ -22,23 +19,91 @@ function terminalLabel(app: AppFolder): string {
   return `RepoStart ${app.label}`;
 }
 
-interface ErrorGuidance {
-  pattern: RegExp;
-  message: string;
+/**
+ * A Pseudoterminal that spawns the service process directly and pipes
+ * its output to the VS Code terminal. This gives us RELIABLE process
+ * exit detection — no temp files, no shell wrappers, no polling.
+ *
+ * When the process exits (crash, Ctrl+C, or normal), the `exit` event
+ * fires and we call the onExit callback immediately.
+ */
+class ServicePseudoterminal implements vscode.Pseudoterminal {
+  private writeEmitter = new vscode.EventEmitter<string>();
+  onDidWrite = this.writeEmitter.event;
+
+  private closeEmitter = new vscode.EventEmitter<number | void>();
+  onDidClose = this.closeEmitter.event;
+
+  private process: ChildProcess | undefined;
+
+  constructor(
+    private cmd: string,
+    private cwd: string,
+    private env: Record<string, string>,
+    private onExit: (code: number) => void
+  ) {}
+
+  open(_initialDimensions: vscode.TerminalDimensions | undefined): void {
+    this.writeEmitter.fire(`$ ${this.cmd}\r\n`);
+
+    try {
+      this.process = spawn(this.cmd, {
+        shell: true,
+        cwd: this.cwd,
+        env: this.env,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (err) {
+      this.writeEmitter.fire(`Failed to start: ${(err as Error).message}\r\n`);
+      this.onExit(1);
+      this.closeEmitter.fire(1);
+      return;
+    }
+
+    this.process.stdout?.on('data', (data: Buffer) => {
+      this.writeEmitter.fire(data.toString());
+    });
+
+    this.process.stderr?.on('data', (data: Buffer) => {
+      this.writeEmitter.fire(data.toString());
+    });
+
+    this.process.on('error', (err) => {
+      this.writeEmitter.fire(`Error: ${err.message}\r\n`);
+      this.onExit(1);
+      this.closeEmitter.fire(1);
+    });
+
+    this.process.on('exit', (code, signal) => {
+      const exitCode = code !== null ? code : (signal ? 1 : 0);
+      this.writeEmitter.fire(`\r\n[Process exited with code ${exitCode}]\r\n`);
+      this.onExit(exitCode);
+      this.closeEmitter.fire(exitCode);
+    });
+  }
+
+  close(): void {
+    if (this.process) {
+      try { this.process.kill(); } catch { /* already dead */ }
+    }
+  }
+
+  handleInput(data: string): void {
+    if (data === '\x03') {
+      // Ctrl+C
+      try { this.process?.kill('SIGINT'); } catch { /* ignore */ }
+    } else {
+      this.process?.stdin?.write(data);
+    }
+  }
 }
 
-const ERROR_PATTERNS: ErrorGuidance[] = [
-  { pattern: /EADDRINUSE|address already in use|port.*in use/i, message: 'Port may already be in use. Try stopping other processes or change the port.' },
-  { pattern: /cannot find module|module not found/i,             message: 'Missing module detected. Try running npm install again.' },
-  { pattern: /npm error|yarn error|pnpm error/i,                message: 'Dependency installation failure detected. Check the Logs tab.' },
-  { pattern: /ENOENT.*\.env/i,                                  message: 'Environment file missing. Check your .env configuration.' },
-];
-
-function detectErrorGuidance(line: string): string | null {
-  for (const { pattern, message } of ERROR_PATTERNS) {
-    if (pattern.test(line)) { return message; }
-  }
-  return null;
+interface ManagedTerminal {
+  terminal: vscode.Terminal;
+  role: string;
+  relativePath: string;
+  name: string;
+  closed: boolean;
 }
 
 export interface StartupRunnerOptions {
@@ -50,21 +115,6 @@ export interface StartupRunnerOptions {
   logger?: vscode.OutputChannel;
 }
 
-interface ManagedTerminal {
-  terminal: vscode.Terminal;
-  role: string;
-  relativePath: string;
-  name: string;
-  /** Whether we've already fired the "stopped" callback. */
-  closed: boolean;
-  /** Temp file path — created when the command exits. */
-  exitFile: string;
-  /** Path to the wrapper JS file. */
-  wrapperFile: string;
-}
-
-const POLLER_INTERVAL_MS = 1000;
-
 export class StartupRunner {
   private apps: AppFolder[];
   private timeline: ActivityTimeline;
@@ -74,7 +124,6 @@ export class StartupRunner {
   private logger?: vscode.OutputChannel;
 
   private managedTerminals: ManagedTerminal[] = [];
-  private _exitPoller?: NodeJS.Timeout;
 
   constructor(opts: StartupRunnerOptions) {
     this.apps             = opts.apps;
@@ -131,62 +180,7 @@ export class StartupRunner {
       (frontendApp && backendApp ? ' (split terminal requested)' : '')
     );
 
-    this.log(`Started ${this.managedTerminals.length} managed terminal(s):`);
-    for (const mt of this.managedTerminals) {
-      this.log(`  - ${mt.role} [${mt.relativePath}] name="${mt.name}" exitFile="${mt.exitFile}"`);
-    }
-
-    this._startExitPolling();
-  }
-
-  /**
-   * Create a Node.js wrapper script that:
-   * 1. Spawns the actual command (npm run start, etc.)
-   * 2. Pipes stdin/stdout/stderr to the terminal (user sees all output)
-   * 3. When the command exits, writes the exit code to a temp file
-   *
-   * This is SHELL-AGNOSTIC — works identically on bash, zsh, PowerShell,
-   * cmd.exe, fish, etc. because it's just `node wrapper.js`.
-   */
-  private _createWrapperScript(cmd: string, cwd: string, exitFile: string): string {
-    const wrapperPath = path.join(os.tmpdir(), `repostart-wrapper-${uid()}.js`);
-
-    // The wrapper script spawns the command, inherits stdio (so the user
-    // sees all output in the terminal), and writes the exit code to a
-    // file when the command finishes. The script process then EXITS,
-    // which means terminal.exitStatus will ALSO become defined — giving
-    // us two detection mechanisms.
-    const script = `
-const { spawn } = require('child_process');
-const fs = require('fs');
-const exitFile = ${JSON.stringify(exitFile)};
-const cmd = ${JSON.stringify(cmd)};
-const cwd = ${JSON.stringify(cwd)};
-
-const child = spawn(cmd, {
-  shell: true,
-  stdio: 'inherit',
-  cwd: cwd,
-  env: process.env
-});
-
-child.on('error', (err) => {
-  console.error('Failed to start:', err.message);
-  try { fs.writeFileSync(exitFile, '1'); } catch {}
-  process.exit(1);
-});
-
-child.on('exit', (code, signal) => {
-  const exitCode = code !== null ? code : (signal ? 1 : 0);
-  try { fs.writeFileSync(exitFile, String(exitCode)); } catch {}
-  // Exit the wrapper process too — this makes terminal.exitStatus
-  // fire as a backup detection mechanism.
-  process.exit(exitCode);
-});
-`;
-
-    fs.writeFileSync(wrapperPath, script, 'utf-8');
-    return wrapperPath;
+    this.log(`Started ${this.managedTerminals.length} managed terminal(s)`);
   }
 
   private _launchInTerminal(
@@ -204,44 +198,43 @@ child.on('exit', (code, signal) => {
 
     this.streamer.system(`Launching: ${cmd}  (in ${app.relativePath})`, source);
 
-    // Generate a unique temp file for this terminal's exit code.
-    const exitFile = path.join(os.tmpdir(), `repostart-exit-${uid()}.txt`);
+    const role = app.isFrontend ? 'Frontend' : app.isBackend ? 'Backend' : app.label;
 
-    // Create the shell-agnostic wrapper script.
-    const wrapperFile = this._createWrapperScript(cmd, app.path, exitFile);
-
-    // The command to run in the terminal is just: node /path/to/wrapper.js
-    // This works on ALL shells — bash, zsh, PowerShell, cmd.exe, fish.
-    const wrappedCmd = `node "${wrapperFile}"`;
-
-    const terminalOptions: vscode.TerminalOptions = {
+    // Create a placeholder for the managed terminal entry so the
+    // onExit callback can reference it.
+    const managed: ManagedTerminal = {
+      terminal: undefined!,
+      role,
+      relativePath: app.relativePath,
       name,
-      cwd: app.path,
-      env: process.env as Record<string, string>,
+      closed: false,
+    };
+
+    // Create the Pseudoterminal. The onExit callback fires DIRECTLY
+    // from the child process's exit event — no polling needed.
+    const pty = new ServicePseudoterminal(
+      cmd,
+      app.path,
+      process.env as Record<string, string>,
+      (exitCode) => {
+        this.log(`[Pseudoterminal.onExit] ${role} exited with code ${exitCode}`);
+        this._handleProcessExit(managed, exitCode);
+      }
+    );
+
+    const terminalOptions: vscode.ExtensionTerminalOptions = {
+      name,
+      pty,
       ...(parentTerminal ? { location: { parentTerminal } } : {}),
     };
 
     const terminal = vscode.window.createTerminal(terminalOptions);
     terminal.show(false);
-    terminal.sendText(wrappedCmd);
 
-    const role = app.isFrontend ? 'Frontend' : app.isBackend ? 'Backend' : app.label;
-
-    const managed: ManagedTerminal = {
-      terminal,
-      role,
-      relativePath: app.relativePath,
-      name,
-      closed: false,
-      exitFile,
-      wrapperFile,
-    };
-
+    managed.terminal = terminal;
     this.managedTerminals.push(managed);
 
-    this.log(`_launchInTerminal: ${role} [${app.relativePath}] → running`);
-    this.log(`  wrapper: ${wrapperFile}`);
-    this.log(`  exitFile: ${exitFile}`);
+    this.log(`_launchInTerminal: ${role} [${app.relativePath}] → running (Pseudoterminal)`);
 
     this.onServiceStatus?.({
       label: role,
@@ -264,65 +257,10 @@ child.on('exit', (code, signal) => {
     return terminal;
   }
 
-  // ── Exit polling via temp file + terminal.exitStatus ────────────
-
-  private _startExitPolling(): void {
-    if (this._exitPoller) return;
-    this.log(`Starting exit poller (interval: ${POLLER_INTERVAL_MS}ms)`);
-    this._exitPoller = setInterval(() => {
-      this._checkTerminalExits();
-    }, POLLER_INTERVAL_MS);
-  }
-
-  private _stopExitPolling(): void {
-    if (this._exitPoller) {
-      this.log('Stopping exit poller');
-      clearInterval(this._exitPoller);
-      this._exitPoller = undefined;
-    }
-  }
-
   /**
-   * Check each managed terminal for exit.
-   *
-   * DUAL DETECTION:
-   * 1. Exit file exists → command exited (primary, works even if shell
-   *    stays open)
-   * 2. terminal.exitStatus is defined → terminal process exited
-   *    (backup, works when wrapper script exits)
+   * Called when the child process exits — DIRECTLY from the
+   * Pseudoterminal's exit event. No polling, no temp files.
    */
-  private _checkTerminalExits(): void {
-    for (const mt of this.managedTerminals) {
-      if (mt.closed) continue;
-
-      // Method 1: Check exit file (command exited)
-      let exitCode: number | null = null;
-      try {
-        if (fs.existsSync(mt.exitFile)) {
-          const content = fs.readFileSync(mt.exitFile, 'utf-8').trim();
-          exitCode = parseInt(content, 10);
-          if (isNaN(exitCode)) exitCode = 1;
-          this.log(`_checkTerminalExits: "${mt.name}" exit FILE detected (code=${exitCode})`);
-        }
-      } catch { /* ignore */ }
-
-      // Method 2: Check terminal.exitStatus (terminal process exited)
-      if (exitCode === null) {
-        try {
-          const status = mt.terminal.exitStatus;
-          if (status !== undefined) {
-            exitCode = status.code;
-            this.log(`_checkTerminalExits: "${mt.name}" exit STATUS detected (code=${exitCode})`);
-          }
-        } catch { /* ignore */ }
-      }
-
-      if (exitCode !== null) {
-        this._handleProcessExit(mt, exitCode);
-      }
-    }
-  }
-
   private _handleProcessExit(mt: ManagedTerminal, exitCode: number): void {
     if (mt.closed) return;
     mt.closed = true;
@@ -333,10 +271,6 @@ child.on('exit', (code, signal) => {
     if (idx >= 0) {
       this.managedTerminals.splice(idx, 1);
     }
-
-    // Clean up temp files
-    try { fs.unlinkSync(mt.exitFile); } catch { /* ignore */ }
-    try { fs.unlinkSync(mt.wrapperFile); } catch { /* ignore */ }
 
     this.log(`_handleProcessExit: sending ${mt.role} → stopped to dashboard`);
 
@@ -375,6 +309,10 @@ child.on('exit', (code, signal) => {
   }
 
   // ── Terminal-close handling (manual close via trash icon) ───────
+  // This is a BACKUP. The Pseudoterminal's close() method kills the
+  // process, which fires the exit event, which calls _handleProcessExit.
+  // But we also handle onDidCloseTerminal in case the Pseudoterminal's
+  // close doesn't fire for some reason.
 
   isManagedTerminal(terminal: vscode.Terminal): boolean {
     const byRef = this.managedTerminals.some((mt) => mt.terminal === terminal);
@@ -399,15 +337,15 @@ child.on('exit', (code, signal) => {
       this.log(`handleTerminalClose: "${managed.name}" already closed — ignoring`);
       return false;
     }
+
+    this.log(`handleTerminalClose: "${managed.name}" closed by user`);
+
+    // The Pseudoterminal's close() will kill the process, which will
+    // fire the exit event and call _handleProcessExit. But just in
+    // case that doesn't happen (e.g., process already dead), we
+    // mark it stopped here too.
     managed.closed = true;
-
     this.managedTerminals.splice(idx, 1);
-
-    // Clean up temp files
-    try { fs.unlinkSync(managed.exitFile); } catch { /* ignore */ }
-    try { fs.unlinkSync(managed.wrapperFile); } catch { /* ignore */ }
-
-    this.log(`handleTerminalClose: processing close for ${managed.role} [${managed.relativePath}]`);
 
     this.onServiceStatus?.({
       label: managed.role,
@@ -451,28 +389,23 @@ child.on('exit', (code, signal) => {
   }
 
   killAll(): void {
-    this._stopExitPolling();
-
     const toKill = this.managedTerminals.splice(0);
     this.log(`killAll: disposing ${toKill.length} managed terminal(s)`);
 
     for (const mt of toKill) {
       mt.closed = true;
-      // Clean up temp files
-      try { fs.unlinkSync(mt.exitFile); } catch { /* ignore */ }
-      try { fs.unlinkSync(mt.wrapperFile); } catch { /* ignore */ }
       try {
         mt.terminal.dispose();
-        this.onServiceStatus?.({
-          label: mt.role,
-          relativePath: mt.relativePath,
-          state: 'stopped',
-        });
       } catch { /* already disposed */ }
+      this.onServiceStatus?.({
+        label: mt.role,
+        relativePath: mt.relativePath,
+        state: 'stopped',
+      });
     }
   }
 
   dispose(): void {
-    this._stopExitPolling();
+    // No poller to stop — Pseudoterminal handles everything.
   }
 }
